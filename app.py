@@ -10,12 +10,12 @@ from datetime import datetime, timedelta
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Finance Advisor 8.1 - Analyse Profonde", page_icon="📈", layout="wide")
-st.title("🤖 Finance Advisor V8.1 - Modélisation Patrimoniale")
-st.markdown("Optimisation Core/Satellite (PEA) + Poche Sécurisée avec analyse de corrélation.")
+st.set_page_config(page_title="Finance Advisor 9.0 - Multi-Univers", page_icon="📈", layout="wide")
+st.title("🤖 Finance Advisor V9.0 - Modélisation Patrimoniale")
+st.markdown("Optimisation Core/Satellite avec filtre PEA et analyse de niches thématiques.")
 
 # ==========================================
-# 2. UNIVERS D'INVESTISSEMENT (ACTIONS / ETF)
+# 2. UNIVERS D'INVESTISSEMENT & FILTRES
 # ==========================================
 ASSET_UNIVERSE = {
     "CAC 40 (Top 20)": [
@@ -26,31 +26,41 @@ ASSET_UNIVERSE = {
         "SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "MBG.DE", "BMW.DE", "MUV2.DE", "BAS.DE", 
         "IFX.DE", "BAYN.DE", "DB1.DE", "DBK.DE"
     ],
-    "ETF & Thématiques (PEA)": [
+    "ETF Globaux": [
         "CW8.PA",    # MSCI World
         "PSP5.PA",   # S&P 500
         "PUST.PA",   # Nasdaq-100
-        "PAEEM.PA",  # Emerging Markets
         "RS2K.PA",   # Russell 2000
-        "ENER.PA",   # New Energy
-        "HLTH.PA",   # Healthcare
-        "PTE.PA"     # Tech Europe
+    ],
+    "Niches (Thématiques, Émergents, Alternatifs)": [
+        "PAEEM.PA",  # Émergents (PEA)
+        "AWAT.PA",   # Eau (PEA)
+        "ENER.PA",   # Énergies Propres (PEA)
+        "PTE.PA",    # Tech Europe (PEA)
+        "HO.PA",     # Thales - Armement/Défense (PEA)
+        "URW.PA",    # Unibail-Rodamco - Immobilier (NON PEA - SIIC)
+        "IGLN.L",    # iShares Physical Gold - Or (NON PEA)
+        "BTC-EUR"    # Bitcoin - Crypto (NON PEA)
     ]
 }
+
+# Liste stricte des actifs NON éligibles au PEA
+NON_PEA_ASSETS = ["URW.PA", "IGLN.L", "BTC-EUR"]
 
 TICKER_NAMES = {
     "MC.PA": "LVMH", "OR.PA": "L'Oréal", "TTE.PA": "TotalEnergies", "RMS.PA": "Hermès", 
     "SAN.PA": "Sanofi", "AIR.PA": "Airbus", "SU.PA": "Schneider", "AI.PA": "Air Liquide", 
     "BNP.PA": "BNP Paribas", "SAF.PA": "Safran", "CAP.PA": "Capgemini", "DSY.PA": "Dassault", 
-    "CS.PA": "AXA", "DG.PA": "Vinci", "EN.PA": "Bouygues",
+    "CS.PA": "AXA", "DG.PA": "Vinci", "EN.PA": "Bouygues", "HO.PA": "Thales (Défense)", "URW.PA": "Unibail-Rodamco (Immobilier)",
     "SAP.DE": "SAP", "SIE.DE": "Siemens", "ALV.DE": "Allianz", "DTE.DE": "Deutsche Telekom", 
     "MBG.DE": "Mercedes-Benz", "BMW.DE": "BMW", "MUV2.DE": "Munich Re", "BAS.DE": "BASF", 
     "IFX.DE": "Infineon", "BAYN.DE": "Bayer", "DB1.DE": "Deutsche Börse", "DBK.DE": "Deutsche Bank",
     "CW8.PA": "Amundi MSCI World", "PSP5.PA": "Amundi S&P 500", 
-    "PUST.PA": "Amundi Nasdaq-100", "PAEEM.PA": "Amundi Emerging", 
-    "RS2K.PA": "Amundi Russell 2000", "ENER.PA": "Lyxor New Energy", 
-    "HLTH.PA": "Lyxor Healthcare", "PTE.PA": "Lyxor Tech Europe",
-    "OBLIG_SIMUL": "🛡️ Obligation Corp (Grade A)"
+    "PUST.PA": "Amundi Nasdaq-100", "RS2K.PA": "Amundi Russell 2000",
+    "PAEEM.PA": "Amundi Emerging Markets", "ENER.PA": "Lyxor New Energy", 
+    "AWAT.PA": "Lyxor Water", "PTE.PA": "Lyxor Tech Europe",
+    "IGLN.L": "Or Physique (iShares Gold)", "BTC-EUR": "Bitcoin",
+    "OBLIG_SIMUL": "🛡️ Poche Sécurisée (Fonds Euros / Monétaire PEA)"
 }
 
 RISK_PROFILES = {"🛡️ Prudent (5%)": 0.05, "⚖️ Équilibré (8%)": 0.08, "🚀 Dynamique (12%)": 0.12}
@@ -60,29 +70,30 @@ RISK_PROFILES = {"🛡️ Prudent (5%)": 0.05, "⚖️ Équilibré (8%)": 0.08, 
 # ==========================================
 st.sidebar.header("👤 Profil Investisseur")
 montant = st.sidebar.number_input("Capital à investir (€)", min_value=500, value=10000, step=500)
-horizon = st.sidebar.slider("Horizon de placement (ans)", 5, 30, 10, help="Le PEA nécessite un minimum de 5 ans pour l'avantage fiscal.")
-profil_nom = st.sidebar.selectbox("Profil de Risque", list(RISK_PROFILES.keys()), help="Définit l'objectif de rendement et le niveau de volatilité toléré.")
+horizon = st.sidebar.slider("Horizon de placement (ans)", 5, 30, 10)
+profil_nom = st.sidebar.selectbox("Profil de Risque", list(RISK_PROFILES.keys()))
 target_return = RISK_PROFILES[profil_nom]
 
 st.sidebar.markdown("---")
+st.sidebar.header("⚖️ Contraintes Fiscales")
+pea_only = st.sidebar.checkbox("🟢 Restreindre aux actifs éligibles PEA", value=True, help="Si coché, l'algorithme exclura automatiquement l'Or, les Cryptos et l'Immobilier (SIIC).")
 
-with st.sidebar.expander("⚙️ Paramètres Avancés (Expert)"):
-    st.markdown("**Sélecteur d'Univers**")
+st.sidebar.markdown("---")
+with st.sidebar.expander("⚙️ Sélecteur d'Univers & Paramètres"):
     choix_univers = st.radio(
-        "Filtrer les actions :", 
-        ("Actions & ETF", "Uniquement ETF", "Uniquement CAC 40", "Uniquement DAX 40"),
-        label_visibility="collapsed"
+        "Filtrer les classes d'actifs :", 
+        ("Mix Global", "Uniquement ETF Globaux", "Uniquement Niches (Thématiques & Alternatifs)", "Uniquement CAC 40", "Uniquement DAX 40")
     )
-    max_actifs = st.slider("Actifs maximum", 3, 15, 8, help="Force l'algorithme à concentrer le capital.")
+    max_actifs = st.slider("Actifs maximum retenus", 3, 15, 8)
     
     st.markdown("---")
-    st.markdown("**Poche Sécurisée (Obligation)**")
-    inclure_oblig = st.checkbox("Activer l'Obligation Grade A", value=True, help="Simule un fonds en euros ou une obligation pour stabiliser le portefeuille.")
-    bond_yield = st.slider("Rendement actuel estimé", 1.0, 8.0, 4.0, 0.1) / 100
-    bond_vol = 0.02
+    st.markdown("**Poche Sécurisée**")
+    inclure_oblig = st.checkbox("Activer la Poche Sécurisée", value=True, help="Simule un Monétaire PEA ou un Fonds Euros.")
+    bond_yield = st.slider("Rendement actuel estimé", 1.0, 8.0, 3.5, 0.1) / 100
+    bond_vol = 0.01
 
 # ==========================================
-# 4. FONCTIONS DE RÉCUPÉRATION DE DONNÉES
+# 4. FONCTIONS DE RÉCUPÉRATION
 # ==========================================
 @st.cache_data(ttl=86400)
 def load_data(tickers):
@@ -94,19 +105,19 @@ def get_company_info(tickers):
     info_dict = {}
     for t in tickers:
         if t == "OBLIG_SIMUL":
-            info_dict[t] = {"sector": "Obligations / Taux", "summary": "Actif synthétique simulant une obligation d'entreprise (Grade A) ou un Fonds en Euros à rendement fixe. Assure la stabilité du portefeuille.", "yield": f"{bond_yield*100:.2f}%"}
+            info_dict[t] = {"sector": "Liquidité / Taux", "summary": "Actif synthétique assurant la stabilité. Peut représenter un OPCVM Monétaire (éligible PEA) ou un Fonds en Euros d'Assurance Vie.", "yield": f"{bond_yield*100:.2f}%"}
             continue
         try:
             ticker_obj = yf.Ticker(t)
             info = ticker_obj.info
-            summary = info.get('longBusinessSummary', 'Description détaillée non fournie par le gestionnaire du fonds.')
+            summary = info.get('longBusinessSummary', 'Description non fournie.')
             if len(summary) > 400: summary = summary[:400] + "..."
-            sector = info.get('sector', info.get('category', 'Fonds Indiciel (ETF)'))
+            sector = info.get('sector', info.get('category', 'Fonds / Alternatif'))
             y_val = info.get('dividendYield', 'N/A')
             if y_val != 'N/A' and y_val is not None: y_val = f"{y_val*100:.2f}%"
             info_dict[t] = {"sector": sector, "summary": summary, "yield": y_val}
         except:
-            info_dict[t] = {"sector": "N/A", "summary": "Données fondamentales indisponibles.", "yield": "N/A"}
+            info_dict[t] = {"sector": "N/A", "summary": "Données indisponibles.", "yield": "N/A"}
     return info_dict
 
 def get_metrics(weights, means, cov):
@@ -123,14 +134,23 @@ def opt_func(weights, means, cov, target):
 # ==========================================
 if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
     
+    # 1. Sélection de l'univers
     tickers_sub = []
-    if choix_univers == "Uniquement ETF": tickers_sub = ASSET_UNIVERSE["ETF & Thématiques (PEA)"]
+    if choix_univers == "Uniquement ETF Globaux": tickers_sub = ASSET_UNIVERSE["ETF Globaux"]
+    elif choix_univers == "Uniquement Niches (Thématiques & Alternatifs)": tickers_sub = ASSET_UNIVERSE["Niches (Thématiques, Émergents, Alternatifs)"]
     elif choix_univers == "Uniquement CAC 40": tickers_sub = ASSET_UNIVERSE["CAC 40 (Top 20)"]
     elif choix_univers == "Uniquement DAX 40": tickers_sub = ASSET_UNIVERSE["DAX 40 (Top 20)"]
     else: 
         for cat in ASSET_UNIVERSE.values(): tickers_sub.extend(cat)
 
-    with st.spinner("Téléchargement des marchés et analyse approfondie des actifs..."):
+    # 2. Filtre d'éligibilité PEA
+    if pea_only:
+        tickers_sub = [t for t in tickers_sub if t not in NON_PEA_ASSETS]
+        if not tickers_sub:
+            st.error("❌ Aucun actif ne correspond à votre sélection. (Exemple: Vous demandez des 'Niches' mais excluez les actifs non-PEA, limitant drastiquement les choix).")
+            st.stop()
+
+    with st.spinner(f"Analyse de {len(tickers_sub)} actifs..."):
         
         data = load_data(tickers_sub)
         returns = data.pct_change().dropna()
@@ -138,6 +158,7 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
         cov_matrix = returns.cov() * 252
         individual_vols = returns.std() * np.sqrt(252)
 
+        # Injection de l'actif sécurisé
         if inclure_oblig:
             bond_ticker = "OBLIG_SIMUL"
             mean_returns.loc[bond_ticker] = bond_yield
@@ -170,10 +191,15 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
         tab1, tab2, tab3 = st.tabs(["📊 Allocation & Analyse", "🕰️ Backtest Historique", "🚀 Projections Futures"])
 
         with tab1:
+            if pea_only:
+                st.success("🟢 Portefeuille 100% structuré pour une enveloppe PEA.")
+            else:
+                st.warning("🟠 Portefeuille contenant des actifs non-PEA (Nécessite un Compte Titres ou de la Crypto).")
+
             c1, c2, c3 = st.columns(3)
-            c1.metric("Rendement Espéré", f"{real_r*100:.1f}%", help="Rendement moyen annualisé visé par l'algorithme.")
-            c2.metric("Volatilité (Risque)", f"{real_std*100:.1f}%", help="Fluctuation attendue. Plus le chiffre est bas, plus le portefeuille est stable.", delta_color="inverse")
-            c3.metric("Diversification", f"{len(final_weights)} actifs", help="Nombre d'actifs retenus par le modèle.")
+            c1.metric("Rendement Espéré", f"{real_r*100:.1f}%")
+            c2.metric("Volatilité (Risque)", f"{real_std*100:.1f}%", delta_color="inverse")
+            c3.metric("Diversification", f"{len(final_weights)} actifs")
             st.markdown("---")
             
             c_chart, c_table = st.columns([1, 1.2])
@@ -202,7 +228,6 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
             
             with c_corr:
                 st.subheader("🔗 Matrice de Corrélation")
-                st.info("Comprendre l'algorithme : Le modèle recherche des actifs en bleu (décorrélés) pour diminuer le risque global en cas de krach boursier.")
                 real_tickers = [t for t in final_weights.keys() if t != "OBLIG_SIMUL"]
                 if len(real_tickers) > 1:
                     corr_matrix_display = returns[real_tickers].corr()
@@ -211,23 +236,23 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
                     fig_corr = px.imshow(corr_matrix_display, text_auto=".2f", color_continuous_scale="RdBu_r", aspect="auto", zmin=-1, zmax=1)
                     st.plotly_chart(fig_corr, use_container_width=True)
                 else:
-                    st.warning("Pas assez d'actifs réels pour afficher une corrélation.")
+                    st.warning("Pas assez d'actifs pour calculer une corrélation.")
 
             with c_info:
                 st.subheader("📖 Fiches d'Identité")
-                st.markdown("Découvrez en détail les actifs sélectionnés pour vous :")
                 asset_info = get_company_info(list(final_weights.keys()))
-                
                 for t in final_weights.keys():
                     with st.expander(f"**{TICKER_NAMES.get(t, t)}** — Poids : {final_weights[t]*100:.1f}%"):
+                        # Indication de l'éligibilité PEA sur la fiche
+                        pea_status = "❌ Non-éligible" if t in NON_PEA_ASSETS else "✅ Éligible"
+                        if t == "OBLIG_SIMUL": pea_status = "✅ Éligible (Si Monétaire)"
+                        st.markdown(f"**Statut PEA :** {pea_status}")
                         st.markdown(f"**Secteur / Catégorie :** {asset_info[t]['sector']}")
                         st.markdown(f"**Rendement Distribué :** {asset_info[t]['yield']}")
                         st.markdown(f"*{asset_info[t]['summary']}*")
 
         with tab2:
-            st.info("Performance incluant la simulation de la croissance constante de l'obligation.")
-            
-            # Correction cruciale : on isole d'abord les vrais actifs
+            st.info("Performance incluant la simulation de la poche sécurisée.")
             real_tickers = [t for t in final_weights.keys() if t != "OBLIG_SIMUL"]
             
             if real_tickers:
@@ -235,21 +260,16 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
             else:
                 pct_change_data = pd.DataFrame(index=data.index)
             
-            # Ensuite, on ajoute l'obligation mathématique
             if inclure_oblig and "OBLIG_SIMUL" in final_weights:
                 daily_bond_yield = (1 + bond_yield) ** (1/252) - 1
                 pct_change_data["OBLIG_SIMUL"] = daily_bond_yield
             
-            # On réordonne les colonnes pour que le produit scalaire fonctionne
             pct_change_data = pct_change_data[list(final_weights.keys())]
-            
             hist_ret = pct_change_data.dot(list(final_weights.values()))
             st.line_chart((1 + hist_ret).cumprod() * montant)
 
         with tab3:
-            st.info("Modélisation géométrique brownienne (L'obligation incluse génère des intérêts composés constants).")
             years = np.arange(0, horizon + 1)
-            
             def calc_path(type_scen):
                 path = [montant]
                 for y in range(1, horizon + 1):
@@ -261,13 +281,9 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
 
             fig_proj = go.Figure()
             fig_proj.add_trace(go.Scatter(x=years, y=calc_path("Optimiste"), name="🚀 Optimiste", line=dict(color='green', dash='dash')))
-            fig_proj.add_trace(go.Scatter(x=years, y=calc_path("Normal"), name="⚖️ Normal (Attendu)", fill='tonexty', line=dict(color='blue', width=3)))
-            fig_proj.add_trace(go.Scatter(x=years, y=calc_path("Pessimiste"), name="📉 Pessimiste (Krach Actions)", line=dict(color='red')))
+            fig_proj.add_trace(go.Scatter(x=years, y=calc_path("Normal"), name="⚖️ Normal", fill='tonexty', line=dict(color='blue', width=3)))
+            fig_proj.add_trace(go.Scatter(x=years, y=calc_path("Pessimiste"), name="📉 Pessimiste", line=dict(color='red')))
             fig_proj.update_layout(xaxis_title="Années", yaxis_title="Valeur Projetée (€)", hovermode="x unified")
             st.plotly_chart(fig_proj, use_container_width=True)
-            
-            if inclure_oblig and "OBLIG_SIMUL" in final_weights:
-                poids_secu = final_weights["OBLIG_SIMUL"] * 100
-                st.success(f"🛡️ Le scénario pessimiste est fortement amorti car **{poids_secu:.1f}%** de votre portefeuille est protégé par l'obligation à {bond_yield*100:.1f}%.")
 else:
     st.info("👈 Ajustez vos paramètres dans le panneau de gauche et cliquez sur 'Optimiser l'Allocation'.")
