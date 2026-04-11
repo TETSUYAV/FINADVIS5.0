@@ -10,8 +10,8 @@ from datetime import datetime, timedelta
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Finance Advisor 8.0 - Analyse Profonde", page_icon="📈", layout="wide")
-st.title("🤖 Finance Advisor V8.0 - Modélisation Patrimoniale")
+st.set_page_config(page_title="Finance Advisor 8.1 - Analyse Profonde", page_icon="📈", layout="wide")
+st.title("🤖 Finance Advisor V8.1 - Modélisation Patrimoniale")
 st.markdown("Optimisation Core/Satellite (PEA) + Poche Sécurisée avec analyse de corrélation.")
 
 # ==========================================
@@ -89,7 +89,7 @@ def load_data(tickers):
     data = yf.download(tickers, start=(datetime.now() - timedelta(days=365*10)), end=datetime.now(), auto_adjust=True)['Close']
     return data.dropna(axis=1, how='all').ffill().bfill()
 
-@st.cache_data(ttl=604800) # Cache d'une semaine pour les descriptions (très lent à télécharger)
+@st.cache_data(ttl=604800)
 def get_company_info(tickers):
     info_dict = {}
     for t in tickers:
@@ -100,7 +100,6 @@ def get_company_info(tickers):
             ticker_obj = yf.Ticker(t)
             info = ticker_obj.info
             summary = info.get('longBusinessSummary', 'Description détaillée non fournie par le gestionnaire du fonds.')
-            # Raccourcir le texte pour l'affichage
             if len(summary) > 400: summary = summary[:400] + "..."
             sector = info.get('sector', info.get('category', 'Fonds Indiciel (ETF)'))
             y_val = info.get('dividendYield', 'N/A')
@@ -133,14 +132,12 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
 
     with st.spinner("Téléchargement des marchés et analyse approfondie des actifs..."):
         
-        # A. Données réelles
         data = load_data(tickers_sub)
         returns = data.pct_change().dropna()
         mean_returns = returns.mean() * 252
         cov_matrix = returns.cov() * 252
         individual_vols = returns.std() * np.sqrt(252)
 
-        # B. INJECTION DE L'OBLIGATION SYNTHÉTIQUE
         if inclure_oblig:
             bond_ticker = "OBLIG_SIMUL"
             mean_returns.loc[bond_ticker] = bond_yield
@@ -150,7 +147,6 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
                 cov_matrix.loc[bond_ticker, col] = 0.0
             cov_matrix.loc[bond_ticker, bond_ticker] = bond_vol ** 2
 
-        # C. Optimisation
         num = len(mean_returns)
         max_ret = mean_returns.max()
         if target_return > max_ret: target_return = max_ret
@@ -174,14 +170,12 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
         tab1, tab2, tab3 = st.tabs(["📊 Allocation & Analyse", "🕰️ Backtest Historique", "🚀 Projections Futures"])
 
         with tab1:
-            # En-tête des métriques
             c1, c2, c3 = st.columns(3)
             c1.metric("Rendement Espéré", f"{real_r*100:.1f}%", help="Rendement moyen annualisé visé par l'algorithme.")
             c2.metric("Volatilité (Risque)", f"{real_std*100:.1f}%", help="Fluctuation attendue. Plus le chiffre est bas, plus le portefeuille est stable.", delta_color="inverse")
             c3.metric("Diversification", f"{len(final_weights)} actifs", help="Nombre d'actifs retenus par le modèle.")
             st.markdown("---")
             
-            # Graphique et Tableau
             c_chart, c_table = st.columns([1, 1.2])
             with c_chart:
                 df_pie = pd.DataFrame({"Nom": [TICKER_NAMES.get(t, t) for t in final_weights.keys()], "Poids": list(final_weights.values())})
@@ -204,14 +198,11 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
                 }, hide_index=True, use_container_width=True)
 
             st.markdown("---")
-            
-            # NOUVEAU : Matrice de Corrélation et Fiches Actifs
             c_corr, c_info = st.columns([1, 1])
             
             with c_corr:
                 st.subheader("🔗 Matrice de Corrélation")
                 st.info("Comprendre l'algorithme : Le modèle recherche des actifs en bleu (décorrélés) pour diminuer le risque global en cas de krach boursier.")
-                # On ne calcule la corrélation que sur les vrais actifs (hors obligation synthétique)
                 real_tickers = [t for t in final_weights.keys() if t != "OBLIG_SIMUL"]
                 if len(real_tickers) > 1:
                     corr_matrix_display = returns[real_tickers].corr()
@@ -225,10 +216,8 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
             with c_info:
                 st.subheader("📖 Fiches d'Identité")
                 st.markdown("Découvrez en détail les actifs sélectionnés pour vous :")
-                # Récupération asynchrone des infos Yahoo
                 asset_info = get_company_info(list(final_weights.keys()))
                 
-                # Création des menus déroulants pour chaque actif
                 for t in final_weights.keys():
                     with st.expander(f"**{TICKER_NAMES.get(t, t)}** — Poids : {final_weights[t]*100:.1f}%"):
                         st.markdown(f"**Secteur / Catégorie :** {asset_info[t]['sector']}")
@@ -237,11 +226,24 @@ if st.sidebar.button("⚡ Optimiser l'Allocation", type="primary"):
 
         with tab2:
             st.info("Performance incluant la simulation de la croissance constante de l'obligation.")
-            pct_change_data = data[list(final_weights.keys()) if "OBLIG_SIMUL" not in final_weights else list(final_weights.keys())].copy()
+            
+            # Correction cruciale : on isole d'abord les vrais actifs
+            real_tickers = [t for t in final_weights.keys() if t != "OBLIG_SIMUL"]
+            
+            if real_tickers:
+                pct_change_data = data[real_tickers].pct_change().fillna(0)
+            else:
+                pct_change_data = pd.DataFrame(index=data.index)
+            
+            # Ensuite, on ajoute l'obligation mathématique
             if inclure_oblig and "OBLIG_SIMUL" in final_weights:
                 daily_bond_yield = (1 + bond_yield) ** (1/252) - 1
                 pct_change_data["OBLIG_SIMUL"] = daily_bond_yield
-            hist_ret = pct_change_data[list(final_weights.keys())].pct_change().fillna(0).dot(list(final_weights.values()))
+            
+            # On réordonne les colonnes pour que le produit scalaire fonctionne
+            pct_change_data = pct_change_data[list(final_weights.keys())]
+            
+            hist_ret = pct_change_data.dot(list(final_weights.values()))
             st.line_chart((1 + hist_ret).cumprod() * montant)
 
         with tab3:
