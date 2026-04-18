@@ -417,7 +417,7 @@ def backtest_with_rebalancing(
     daily_returns = prices.pct_change().fillna(0)
 
     # Fréquence de rééquilibrage
-    freq_map = {"Annuel": "A", "Semestriel": "6M", "Aucun": None}
+    freq_map = {"Annuel": "YE", "Semestriel": "6ME", "Aucun": None}
     freq = freq_map[rebalancing_freq]
 
     portfolio_value = montant
