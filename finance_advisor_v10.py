@@ -691,7 +691,7 @@ if run_btn:
             })
             colors = px.colors.qualitative.Vivid
             fig_pie = px.pie(df_pie, values="Poids", names="Nom", hole=0.45,
-                             color_sequence=colors)
+                             color_discrete_sequence=colors)
             fig_pie.update_traces(textposition="outside", textfont_size=11)
             fig_pie.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)",
