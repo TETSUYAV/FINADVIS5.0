@@ -201,6 +201,14 @@ with st.sidebar:
         bl_view_alpha = st.slider("Surperformance attendue (%/an)", -10.0, 30.0, 5.0, 0.5) / 100
         bl_confidence = st.slider("Confiance dans la vue (%)", 10, 90, 50) / 100
 
+    st.markdown("---")
+    st.session_state["mode_expert"] = st.toggle(
+        "🎓 Mode Expert",
+        value=st.session_state["mode_expert"],
+        key="expert_toggle",
+        help="Affiche les formules mathématiques dans la section pédagogique"
+    )
+
     run_btn = st.button("⚡ Lancer l'Analyse", type="primary", use_container_width=True)
 
 # ==========================================
@@ -779,13 +787,6 @@ if run_btn:
         # ── SECTION PÉDAGOGIQUE ─────────────────────────────────────────────
         st.markdown("---")
         st.markdown("### 📚 Comprendre les modèles & termes techniques")
-        col_toggle, _ = st.columns([1, 2])
-        with col_toggle:
-            st.session_state["mode_expert"] = st.toggle(
-                "🎓 Mode Expert — Formules mathématiques",
-                value=st.session_state["mode_expert"],
-                key="expert_toggle"
-            )
         mode_expert = st.session_state["mode_expert"]
         edu_cols = st.columns(3)
 
