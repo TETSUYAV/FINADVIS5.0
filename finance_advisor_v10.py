@@ -399,54 +399,58 @@ def backtest_with_rebalancing(
     frais_courtage: float
 ) -> pd.Series:
     """
-    Backtest réaliste avec rééquilibrage périodique et déduction des frais de courtage.
-    Retourne la série temporelle de la valeur du portefeuille.
+    Backtest avec double comptabilité risky/bond.
+    risky_value suit les holdings en prix absolus.
+    bond_value capitalise quotidiennement de façon independante.
     """
     tickers_real = [t for t in target_weights if t != "OBLIG_SIMUL" and t in data.columns]
     if not tickers_real:
         return pd.Series(dtype=float)
 
     prices = data[tickers_real].copy()
-    weights_array = np.array([target_weights.get(t, 0) for t in tickers_real])
-    # Renormalise sans la poche obligataire (gérée séparément)
+
     oblig_w = target_weights.get("OBLIG_SIMUL", 0.0)
     risky_w = 1.0 - oblig_w
-    if weights_array.sum() > 0:
-        weights_array = weights_array / weights_array.sum() * risky_w
 
-    daily_returns = prices.pct_change().fillna(0)
+    # Poids relatifs au sein de la poche risquee (normalises a 1.0)
+    raw_w = np.array([target_weights.get(t, 0.0) for t in tickers_real])
+    if raw_w.sum() > 0:
+        raw_w = raw_w / raw_w.sum()
 
-    # Fréquence de rééquilibrage
+    risky_capital = montant * risky_w
+    bond_value = montant * oblig_w
+
+    p0 = prices.iloc[0].values
+    holdings = raw_w * risky_capital / np.where(p0 > 0, p0, 1.0)
+
     freq_map = {"Annuel": "YE", "Semestriel": "6ME", "Aucun": None}
     freq = freq_map[rebalancing_freq]
-
-    portfolio_value = montant
-    holdings = weights_array * montant / prices.iloc[0].values
-    portfolio_values = [montant]
 
     rebalancing_dates = set()
     if freq:
         idx_rebal = pd.date_range(start=prices.index[0], end=prices.index[-1], freq=freq)
         rebalancing_dates = set(idx_rebal.normalize())
 
+    bond_daily_rate = (1.0 + bond_yield) ** (1.0 / 252) - 1.0
+
+    portfolio_values = [montant]
+
     for i in range(1, len(prices)):
         date = prices.index[i].normalize()
         current_prices = prices.iloc[i].values
-        portfolio_value = (holdings * current_prices).sum()
 
-        # Ajout du rendement de la poche sécurisée
-        if oblig_w > 0:
-            bond_daily = (1 + bond_yield) ** (1/252) - 1
-            portfolio_value += portfolio_values[-1] * oblig_w * bond_daily
+        risky_value = float(np.dot(holdings, current_prices))
+        bond_value = bond_value * (1.0 + bond_daily_rate)
+        total_value = risky_value + bond_value
 
-        # Rééquilibrage si nécessaire
         if date in rebalancing_dates:
-            # Frais de courtage appliqués à la part risquée
-            cost = portfolio_value * risky_w * frais_courtage
-            portfolio_value -= cost
-            holdings = weights_array * (portfolio_value * risky_w) / current_prices
+            cost = total_value * risky_w * frais_courtage
+            total_value -= cost
+            risky_value = total_value * risky_w
+            bond_value = total_value * oblig_w
+            holdings = raw_w * risky_value / np.where(current_prices > 0, current_prices, 1.0)
 
-        portfolio_values.append(portfolio_value)
+        portfolio_values.append(total_value)
 
     return pd.Series(portfolio_values, index=prices.index[:len(portfolio_values)])
 
@@ -618,10 +622,10 @@ if run_btn:
                   "sharpe": 0, "sortino": 0, "max_drawdown": -0.30,
                   "cvar_95": -0.025, "var_95": -0.020, "beta": 1.0, "tracking_error": 0.05}
 
-    # Monte Carlo
+    # Monte Carlo — vol théorique (Ledoit-Wolf) au lieu de la vol empirique du backtest
     mc = monte_carlo_projection(
-        risk_m["ann_return"],
-        risk_m["ann_vol"],
+        port_ret_annual,
+        port_vol_annual,
         montant,
         horizon,
         n_sim=2000,
@@ -790,9 +794,11 @@ if run_btn:
             var_line = risk_m["var_95"] * 100
             cvar_line = risk_m["cvar_95"] * 100
             fig_dist.add_vline(x=var_line, line_color="#fb923c", line_dash="dash",
-                               annotation_text=f"VaR 95%: {var_line:.2f}%")
+                               annotation_text=f"VaR 95%: {var_line:.2f}%",
+                               annotation_position="top left")
             fig_dist.add_vline(x=cvar_line, line_color="#f87171", line_dash="dot",
-                               annotation_text=f"CVaR 95%: {cvar_line:.2f}%")
+                               annotation_text=f"CVaR 95%: {cvar_line:.2f}%",
+                               annotation_position="top left")
             fig_dist.update_layout(
                 title="Distribution des Rendements Journaliers",
                 xaxis_title="Rendement (%)",
