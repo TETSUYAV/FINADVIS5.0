@@ -154,10 +154,6 @@ BENCHMARK_TICKER = "CW8.PA"  # MSCI World comme référence
 # ==========================================
 # 3. SIDEBAR — INTERFACE UTILISATEUR
 # ==========================================
-# Session state pour le toggle expert (doit survivre aux reruns)
-if "mode_expert" not in st.session_state:
-    st.session_state["mode_expert"] = False
-
 with st.sidebar:
     st.markdown("### 👤 Profil Investisseur")
     montant = st.number_input("Capital initial (€)", min_value=500, value=10000, step=500)
@@ -200,14 +196,6 @@ with st.sidebar:
         bl_view_asset = st.selectbox("Actif sur-performant attendu", list(TICKER_NAMES.keys())[:20])
         bl_view_alpha = st.slider("Surperformance attendue (%/an)", -10.0, 30.0, 5.0, 0.5) / 100
         bl_confidence = st.slider("Confiance dans la vue (%)", 10, 90, 50) / 100
-
-    st.markdown("---")
-    st.session_state["mode_expert"] = st.toggle(
-        "🎓 Mode Expert",
-        value=st.session_state["mode_expert"],
-        key="expert_toggle",
-        help="Affiche les formules mathématiques dans la section pédagogique"
-    )
 
     run_btn = st.button("⚡ Lancer l'Analyse", type="primary", use_container_width=True)
 
@@ -787,7 +775,7 @@ if run_btn:
         # ── SECTION PÉDAGOGIQUE ─────────────────────────────────────────────
         st.markdown("---")
         st.markdown("### 📚 Comprendre les modèles & termes techniques")
-        mode_expert = st.session_state["mode_expert"]
+        mode_expert = True
         edu_cols = st.columns(3)
 
         with edu_cols[0]:
