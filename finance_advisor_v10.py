@@ -711,13 +711,23 @@ if run_btn:
             df_table = pd.DataFrame({
                 "Actif": [TICKER_NAMES.get(t, t) for t in final_weights],
                 "Ticker": list(final_weights.keys()),
-                "Poids %": [f"{v*100:.1f}%" for v in final_weights.values()],
-                "Montant €": [f"{v*montant:,.0f} €" for v in final_weights.values()],
-                "Volatilité": [f"{ind_vols.get(t, 0)*100:.1f}%" for t in final_weights],
-                "TER/an": [f"{ASSET_TER.get(t,0)*100:.2f}%" for t in final_weights],
+                "Poids %": [round(v*100, 2) for v in final_weights.values()],
+                "Montant (EUR)": [round(v*montant, 2) for v in final_weights.values()],
+                "Vol %": [round(ind_vols.get(t, 0)*100, 2) for t in final_weights],
+                "TER %/an": [round(ASSET_TER.get(t,0)*100, 3) for t in final_weights],
                 "PEA": ["✅" if t not in NON_PEA_ASSETS else "❌" for t in final_weights]
             })
-            st.dataframe(df_table, use_container_width=True, hide_index=True)
+            st.dataframe(
+                df_table,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Poids %": st.column_config.NumberColumn("Poids %", format="%.1f %%"),
+                    "Montant (EUR)": st.column_config.NumberColumn("Montant (€)", format="%.0f €"),
+                    "Vol %": st.column_config.NumberColumn("Volatilité %", format="%.1f %%"),
+                    "TER %/an": st.column_config.NumberColumn("TER %/an", format="%.2f %%"),
+                }
+            )
 
         st.markdown("---")
         c_corr, c_rc = st.columns(2)
@@ -760,6 +770,155 @@ if run_btn:
                 fig_rc.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#c8d6e5",
                                       showlegend=False, margin=dict(t=10, b=10))
                 st.plotly_chart(fig_rc, use_container_width=True)
+
+
+        # ── SECTION PÉDAGOGIQUE ─────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📚 Comprendre les modèles & termes techniques")
+        mode_expert = st.toggle("🎓 Mode Expert — Formules mathématiques", value=False)
+        edu_cols = st.columns(3)
+
+        with edu_cols[0]:
+            with st.expander("⚖️ Risk Parity (Parité des Risques)"):
+                st.markdown("""
+**En résumé :** Chaque actif contribue *à parts égales* au risque total du portefeuille, quels que soient ses rendements attendus.
+C'est la méthode du fonds Bridgewater All Weather de Ray Dalio.
+
+**Pourquoi ?** Dans Markowitz classique, les actions monopolisent ~90 % du risque même à 60 % du capital.
+Risk Parity surpondère automatiquement les actifs défensifs (obligations, monétaire) pour équilibrer.
+
+**Avantage :** Robuste, ne dépend d'aucune estimation de rendement futur.
+**Inconvénient :** Sous-performe en bull market pur actions ; sensible aux hausses de taux.
+                """)
+                if mode_expert:
+                    st.latex(r"MRC_i = \frac{(\Sigma w)_i}{\sqrt{w^T \Sigma w}}, \quad RC_i = w_i \cdot MRC_i")
+                    st.latex(r"\min_w \sum_{i=1}^{n} \left( \frac{RC_i}{\sum_j RC_j} - \frac{1}{n} \right)^2 \quad s.c. \;\sum_i w_i = 1,\; w_i \geq 0")
+                    st.caption("Minimise l'écart entre contribution effective et cible 1/n. Résolu par SLSQP (gradient projeté).")
+
+            with st.expander("🏦 Black-Litterman"):
+                st.markdown("""
+**En résumé :** Combine l'équilibre implicite du marché (consensus) avec vos propres convictions sur certains actifs.
+Développé à Goldman Sachs (1990) — standard de l'industrie institutionnelle.
+
+**Pourquoi ?** Le Markowitz pur amplifie les erreurs : une légère sur-estimation du rendement d'un actif lui alloue 100 % du capital.
+Black-Litterman ancre sur l'équilibre de marché et n'ajuste que là où vous avez une vue explicite.
+
+**Avantage :** Portefeuilles stables, diversifiés, moins sensibles aux inputs.
+**Inconvénient :** Nécessite des vues prospectives quantifiées et calibrées.
+                """)
+                if mode_expert:
+                    st.latex(r"\Pi = \lambda \Sigma w_{mkt}, \quad \lambda = \frac{E[R_m]-r_f}{\sigma_m^2}")
+                    st.latex(r"\mu_{BL} = \left[(\tau\Sigma)^{-1} + P^T \Omega^{-1} P\right]^{-1} \left[(\tau\Sigma)^{-1}\Pi + P^T\Omega^{-1}Q\right]")
+                    st.caption("P : matrice de vues (1 ligne par vue). Q : rendements attendus des vues. Omega : incertitude sur les vues. tau=0.05 contrôle le poids relatif vues/équilibre.")
+
+            with st.expander("🔬 Ledoit-Wolf Shrinkage"):
+                st.markdown("""
+**En résumé :** Version stabilisée de la matrice de covariance historique, résistante au sur-ajustement sur historiques courts.
+
+**Pourquoi ?** Avec 20 actifs, la matrice brute a 210 paramètres à estimer — très sensible au bruit.
+Le shrinkage la contracte vers une cible structurée, réduisant l'erreur d'estimation out-of-sample.
+
+**Avantage :** Toujours définie positive (solveur converge garanti).
+**Inconvénient :** Lisse les corrélations extrêmes, peut sous-estimer la contagion en crise.
+                """)
+                if mode_expert:
+                    st.latex(r"\hat{\Sigma} = (1-\alpha^*) \cdot S + \alpha^* \cdot T")
+                    st.latex(r"\alpha^* = \arg\min_\alpha \;\mathbb{E}\left[\|\hat{\Sigma}(\alpha) - \Sigma_{true}\|_F^2\right]")
+                    st.caption("S = matrice empirique. T = cible (corrélations constantes). alpha* estimé analytiquement sans cross-validation (Oracle Approximating Shrinkage, Chen et al.).")
+
+        with edu_cols[1]:
+            with st.expander("📉 Max Drawdown"):
+                st.markdown("""
+**En résumé :** La pire perte subie depuis un pic historique.
+Si le portefeuille atteignait 100 000 € puis tombait à 65 000 €, le Max DD est **-35 %**.
+
+**Pourquoi c'est important ?** La volatilité annualisée est abstraite.
+Le Max Drawdown est ce que votre client *ressent* réellement — c'est la mesure de douleur.
+
+**Règle empirique :** Max DD ≈ 2× la volatilité annuelle pour des actifs actions standards.
+Le **Calmar Ratio** = rendement annuel / |Max DD| mesure l'efficacité par unité de souffrance.
+                """)
+                if mode_expert:
+                    st.latex(r"\text{MaxDD} = \min_{t \in [0,T]} \frac{V_t - \max_{s \leq t} V_s}{\max_{s \leq t} V_s}")
+                    st.caption("V_t = valeur du portefeuille à t. Le running maximum M_t = max(V_s, s<=t) représente le dernier pic atteint. Drawdown courant DD_t = (V_t - M_t)/M_t.")
+
+            with st.expander("🎯 VaR & CVaR (Expected Shortfall)"):
+                st.markdown("""
+**VaR 95% :** "Dans 95 % des jours de trading, la perte ne dépassera pas X %." C'est un quantile.
+
+**CVaR 95% :** "Dans les 5 % des pires jours, vous perdrez en moyenne Y %."
+C'est la *moyenne de la queue gauche* — bien plus informative que la VaR seule.
+
+**Pourquoi le CVaR ?** La VaR ne dit rien sur l'*ampleur* des pertes extrêmes.
+Le CVaR est **obligatoire** en reporting institutionnel (Bâle III, UCITS, Solvency II).
+                """)
+                if mode_expert:
+                    st.latex(r"\text{VaR}_\alpha = F_R^{-1}(\alpha)")
+                    st.latex(r"\text{CVaR}_\alpha = \mathbb{E}[R \mid R \leq \text{VaR}_\alpha] = \frac{1}{\alpha}\int_0^\alpha F_R^{-1}(u)\,du")
+                    st.caption("Le CVaR est une mesure de risque cohérente (Artzner 1999) : sous-additive et convexe. La VaR ne l'est pas — deux portefeuilles combinés peuvent avoir une VaR supérieure à leur somme individuelle.")
+
+            with st.expander("📊 Sharpe & Sortino Ratio"):
+                st.markdown("""
+**Sharpe Ratio :** Rendement excédentaire (au-dessus du taux sans risque) par unité de risque *total*.
+Sharpe > 1 = bon, > 2 = excellent, < 0.5 = peu efficace.
+
+**Sortino Ratio :** Comme le Sharpe, mais ne pénalise que la volatilité *baissière*.
+Un portefeuille qui monte fort et baisse peu aura un Sortino bien supérieur à son Sharpe.
+
+**Attention :** Ces ratios sont calculés sur l'historique disponible — ils ne prédisent pas l'avenir.
+                """)
+                if mode_expert:
+                    st.latex(r"\text{Sharpe} = \frac{\bar{R}_p - R_f}{\sigma_p} \cdot \sqrt{252}")
+                    st.latex(r"\text{Sortino} = \frac{\bar{R}_p - R_f}{\sigma_{\downarrow}} \cdot \sqrt{252}, \quad \sigma_{\downarrow} = \sqrt{\frac{1}{T}\sum_{R_t < R_f}(R_t - R_f)^2}")
+                    st.caption("Rf = taux sans risque (3.5% ici, OAT 10 ans approximatif). sigma_down = semi-déviation baissière. Information Ratio = alpha / TE : un IR > 0.5 suggère une compétence de gestion réelle.")
+
+        with edu_cols[2]:
+            with st.expander("🔁 Rééquilibrage & Rebalancing Drag"):
+                st.markdown("""
+**Pourquoi rééquilibrer ?** Sans rééquilibrage, un actif qui surperforme finit par dominer le portefeuille.
+Ex : une poche actions à 60 % peut passer à 80 % après un bull market — risque non désiré.
+
+**Rééquilibrage annuel :** Vendre ce qui a monté, acheter ce qui a baissé.
+C'est une discipline contrariante naturelle qui force un "buy low, sell high" systématique.
+
+**Rebalancing Drag :** Chaque rééquilibrage génère des frais de transaction (courtage paramétrable)
+et potentiellement des événements fiscaux (réalisés en CTO).
+                """)
+                if mode_expert:
+                    st.latex(r"V_{t_k}^{net} = V_{t_k} \cdot (1 - w_{risky} \cdot c)")
+                    st.latex(r"h_i(t_k) = \frac{w_i \cdot V_{t_k}^{net} \cdot w_{risky}}{P_i(t_k)}")
+                    st.caption("c = frais de courtage. w_risky = fraction risquée (on ne rééquilibre pas la poche monétaire). La bande de tolérance optimale (Dumas & Luciano, 1991) n'est pas implémentée — on utilise une approche calendaire.")
+
+            with st.expander("🏛️ Monte Carlo — Mouvement Brownien Géométrique"):
+                st.markdown("""
+**En résumé :** 2 000 "futurs alternatifs" sont simulés en ajoutant chaque année un choc aléatoire
+calibré sur la volatilité théorique du portefeuille (Ledoit-Wolf).
+
+**P10 / P50 / P90 :** Dans 80 % des scénarios, votre capital finit entre P10 et P90.
+P50 est la médiane — scénario central le plus probable.
+
+**Limites :** Le MBG suppose des rendements log-normaux et une volatilité constante.
+Il ne capture pas les crises de liquidité, les corrélations de stress ni les "fat tails".
+                """)
+                if mode_expert:
+                    st.latex(r"S_{t+1} = S_t \cdot \exp\!\left[\left(\mu - \frac{\sigma^2}{2}\right) + \sigma Z_t\right], \quad Z_t \sim \mathcal{N}(0,1)")
+                    st.latex(r"S_T^{net} = S_T - \max(S_T - S_0,\, 0) \cdot \tau")
+                    st.caption("Le terme -sigma²/2 est le volatility drag (inégalité de Jensen) : la moyenne arithmétique doit être ajustée en moyenne géométrique pour refléter la croissance réelle du capital. tau = taux d'imposition sur plus-values (17.2% PEA, 30% CTO).")
+
+            with st.expander("📐 Beta & Tracking Error"):
+                st.markdown("""
+**Beta :** Sensibilité au marché global. Beta = 1.2 → si le MSCI World monte de 10 %,
+votre portefeuille monte de 12 % en moyenne (et perd 12 % si le marché recule de 10 %).
+
+**Tracking Error :** Ecart-type annualisé de la *différence* de performance vs benchmark.
+TE = 5 % → votre performance dévie d'environ ±5 %/an du MSCI World.
+
+**Benchmark ici :** ETF MSCI World (CW8.PA) — le marché actions global capitalisation-pondéré.
+                """)
+                if mode_expert:
+                    st.latex(r"\beta_p = \frac{\text{Cov}(R_p, R_b)}{\text{Var}(R_b)}, \quad \text{TE} = \sigma(R_p - R_b) \cdot \sqrt{252}")
+                    st.latex(r"\alpha = \bar{R}_p - \beta_p \cdot \bar{R}_b \quad \text{(Jensen's Alpha)}")
+                    st.caption("Le CAPM prédit alpha=0 en marché efficient. Un alpha > 0 persistant suggère soit une compétence, soit un risque non capturé (facteurs Fama-French : taille, value, momentum, qualité).")
 
     # ── TAB 2 : RISK MANAGEMENT ────────────────────────────────────────
     with tab2:
