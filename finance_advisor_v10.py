@@ -247,6 +247,34 @@ def compute_ledoit_wolf_cov(returns: pd.DataFrame) -> np.ndarray:
     return lw.covariance_ * 252
 
 
+
+@st.cache_data(ttl=86400)
+def get_market_caps(tickers: list) -> dict:
+    """
+    Récupère les market caps réelles via yfinance pour construire
+    le portefeuille de marché CAPM.  Fallback = médiane du groupe
+    (pas np.ones) pour que les poids restent cohérents même si
+    quelques tickers échouent.
+    """
+    caps = {}
+    for t in tickers:
+        if t == "OBLIG_SIMUL":
+            caps[t] = None
+            continue
+        try:
+            info = yf.Ticker(t).info
+            # marketCap pour les actions, totalAssets pour les ETF/fonds
+            cap = info.get("marketCap") or info.get("totalAssets")
+            caps[t] = float(cap) if cap else None
+        except Exception:
+            caps[t] = None
+
+    # Fallback : remplacer les None par la médiane des caps connues
+    known = [v for v in caps.values() if v is not None and v > 0]
+    fallback = float(np.median(known)) if known else 1.0
+    return {t: (v if v else fallback) for t, v in caps.items()}
+
+
 def black_litterman(
     mean_mkt: np.ndarray,
     cov: np.ndarray,
@@ -281,6 +309,239 @@ def black_litterman(
     M2 = P.T @ np.linalg.inv(Omega) @ P
     mu_bl = np.linalg.inv(M1 + M2) @ (M1 @ pi_eq + P.T @ np.linalg.inv(Omega) @ Q)
     return mu_bl
+
+
+
+
+# ── SCÉNARIOS DE STRESS ──────────────────────────────────────────────────────
+# Chaque scénario définit une fenêtre temporelle de crise historique.
+# On calcule la performance du portefeuille ET du benchmark sur cette période,
+# ainsi que le drawdown max intra-période.
+
+STRESS_SCENARIOS = {
+    "🔴 Crise 2008 (Lehman)": {
+        "start": "2008-09-01",
+        "end":   "2009-03-31",
+        "desc":  "Faillite Lehman Brothers · Gel du crédit mondial · S&P -55% en 17 mois",
+        "color": "#f87171"
+    },
+    "🟠 Krach Covid-19": {
+        "start": "2020-02-19",
+        "end":   "2020-03-23",
+        "desc":  "Pandémie mondiale · Vente panique · Chute la plus rapide de l'histoire (-34% en 33 jours)",
+        "color": "#fb923c"
+    },
+    "🟡 Choc Taux 2022": {
+        "start": "2022-01-03",
+        "end":   "2022-10-12",
+        "desc":  "Hausse brutale des taux Fed/BCE · Krach obligataire · Tech -35%, Bonds -20%",
+        "color": "#fbbf24"
+    },
+    "🔵 Bulle Tech 2000": {
+        "start": "2000-03-10",
+        "end":   "2002-10-09",
+        "desc":  "Éclatement bulle dot-com · Nasdaq -78% en 2.5 ans · Récession NBER 2001",
+        "color": "#60a5fa"
+    },
+}
+
+
+def run_stress_tests(
+    data: pd.DataFrame,
+    final_weights: dict,
+    benchmark_ticker: str,
+    scenarios: dict
+) -> list:
+    """
+    Pour chaque scénario de stress :
+    1. Extrait la fenêtre temporelle du prix de chaque actif du portefeuille
+    2. Simule la performance (return-based, pas holdings — pas de rebalancing intra-crise)
+    3. Calcule : perf totale, max drawdown intra-période, perf benchmark, ratio protection
+    Retourne une liste de dicts prêts pour l'affichage.
+    """
+    results = []
+    tickers_real = [t for t in final_weights if t != "OBLIG_SIMUL" and t in data.columns]
+    oblig_w = final_weights.get("OBLIG_SIMUL", 0.0)
+    risky_w = 1.0 - oblig_w
+
+    # Poids relatifs normalisés dans la poche risquée
+    raw_w = np.array([final_weights.get(t, 0.0) for t in tickers_real])
+    if raw_w.sum() > 0:
+        raw_w = raw_w / raw_w.sum()
+
+    for name, cfg in scenarios.items():
+        try:
+            start = pd.Timestamp(cfg["start"])
+            end   = pd.Timestamp(cfg["end"])
+
+            # Slice the price data for the crisis window
+            window = data[tickers_real].loc[start:end]
+            if len(window) < 5:
+                results.append({
+                    "name": name, "desc": cfg["desc"], "color": cfg["color"],
+                    "port_perf": None, "port_dd": None,
+                    "bench_perf": None, "ratio": None,
+                    "available": False,
+                    "start": cfg["start"], "end": cfg["end"]
+                })
+                continue
+
+            # Rendements journaliers pondérés (poche risquée)
+            daily_r_risky = window.pct_change().fillna(0).dot(raw_w)
+
+            # Rendement journalier de la poche sécurisée
+            bond_daily = (1.0 + bond_yield) ** (1.0 / 252) - 1.0
+
+            # Rendement total du portefeuille = pondération des deux poches
+            daily_r_port = daily_r_risky * risky_w + bond_daily * oblig_w
+
+            # Performance cumulée
+            cum = (1 + daily_r_port).cumprod()
+            port_perf = float(cum.iloc[-1] - 1.0)
+
+            # Max drawdown intra-période
+            roll_max = cum.cummax()
+            dd = (cum - roll_max) / roll_max
+            port_dd = float(dd.min())
+
+            # Benchmark
+            bench_perf = None
+            if benchmark_ticker in data.columns:
+                bench_window = data[benchmark_ticker].loc[start:end]
+                if len(bench_window) > 5:
+                    bench_cum = bench_window / bench_window.iloc[0]
+                    bench_perf = float(bench_cum.iloc[-1] - 1.0)
+
+            # Ratio de protection = 1 - (perte port / perte bench)
+            # > 0 : portefeuille protège mieux que le bench
+            ratio = None
+            if bench_perf is not None and bench_perf < 0 and port_perf < 0:
+                ratio = 1.0 - (port_perf / bench_perf)
+
+            results.append({
+                "name": name,
+                "desc": cfg["desc"],
+                "color": cfg["color"],
+                "port_perf": port_perf,
+                "port_dd": port_dd,
+                "bench_perf": bench_perf,
+                "ratio": ratio,
+                "available": True,
+                "start": cfg["start"],
+                "end": cfg["end"],
+                "cum_series": cum,
+                "bench_series": (
+                    (data[benchmark_ticker].loc[start:end] /
+                     data[benchmark_ticker].loc[start:end].iloc[0])
+                    if benchmark_ticker in data.columns
+                    else None
+                )
+            })
+
+        except Exception as e:
+            results.append({
+                "name": name, "desc": cfg["desc"], "color": cfg["color"],
+                "port_perf": None, "port_dd": None,
+                "bench_perf": None, "ratio": None,
+                "available": False,
+                "start": cfg["start"], "end": cfg["end"]
+            })
+
+    return results
+
+
+def compute_efficient_frontier(
+    mean_returns: pd.Series,
+    cov: np.ndarray,
+    n_points: int = 80,
+    max_w: float = 0.60
+) -> pd.DataFrame:
+    """
+    Trace la frontière efficiente de Markowitz en résolvant n_points
+    portefeuilles à variance minimale pour une grille de rendements cibles.
+
+    Retourne un DataFrame avec colonnes : ret, vol, sharpe, weights_dict
+    + les portefeuilles spéciaux (min-vol, max-sharpe, tangent).
+    """
+    n = len(mean_returns)
+    rf = 0.035  # taux sans risque OAT 10 ans
+
+    # Bornes sûres : on couvre 95% de l'intervalle réalisable
+    r_min = mean_returns.min() * 0.95
+    r_max = mean_returns.max() * 0.95
+    targets = np.linspace(r_min, r_max, n_points)
+
+    rows = []
+    for target in targets:
+        safe_target = np.clip(target, mean_returns.min(), mean_returns.max())
+        bounds = [(0.0, max_w)] * n
+        constraints = [
+            {"type": "eq", "fun": lambda x: float(np.sum(x)) - 1.0},
+            {"type": "eq", "fun": lambda x, t=safe_target: float(mean_returns.values @ x) - t}
+        ]
+        res = sco.minimize(
+            lambda w: float(np.sqrt(w @ cov @ w)),
+            np.ones(n) / n,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={"ftol": 1e-10, "maxiter": 400}
+        )
+        if res.success:
+            w = np.clip(res.x, 0, None)
+            w /= w.sum()
+            vol = float(np.sqrt(w @ cov @ w))
+            ret = float(mean_returns.values @ w)
+            sharpe = (ret - rf) / vol if vol > 0 else 0.0
+            rows.append({
+                "ret": ret, "vol": vol, "sharpe": sharpe,
+                "weights": dict(zip(mean_returns.index, w))
+            })
+
+    df = pd.DataFrame(rows).sort_values("vol").reset_index(drop=True)
+
+    # ── Portefeuilles spéciaux ──────────────────────────────────────────
+    specials = {}
+
+    # Min-vol : déjà le premier point trié par vol, mais on le recalcule proprement
+    res_mv = sco.minimize(
+        lambda w: float(np.sqrt(w @ cov @ w)),
+        np.ones(n) / n,
+        method="SLSQP",
+        bounds=[(0.0, max_w)] * n,
+        constraints=[{"type": "eq", "fun": lambda x: float(np.sum(x)) - 1.0}],
+        options={"ftol": 1e-10, "maxiter": 400}
+    )
+    if res_mv.success:
+        w = np.clip(res_mv.x, 0, None); w /= w.sum()
+        specials["min_vol"] = {
+            "ret": float(mean_returns.values @ w),
+            "vol": float(np.sqrt(w @ cov @ w)),
+            "sharpe": (float(mean_returns.values @ w) - rf) / float(np.sqrt(w @ cov @ w)),
+            "weights": dict(zip(mean_returns.index, w)),
+            "label": "📌 Min-Volatilité"
+        }
+
+    # Max-Sharpe (portefeuille tangent)
+    res_ms = sco.minimize(
+        lambda w: -((float(mean_returns.values @ w) - rf) / float(np.sqrt(w @ cov @ w))),
+        np.ones(n) / n,
+        method="SLSQP",
+        bounds=[(0.0, max_w)] * n,
+        constraints=[{"type": "eq", "fun": lambda x: float(np.sum(x)) - 1.0}],
+        options={"ftol": 1e-10, "maxiter": 400}
+    )
+    if res_ms.success:
+        w = np.clip(res_ms.x, 0, None); w /= w.sum()
+        specials["max_sharpe"] = {
+            "ret": float(mean_returns.values @ w),
+            "vol": float(np.sqrt(w @ cov @ w)),
+            "sharpe": (float(mean_returns.values @ w) - rf) / float(np.sqrt(w @ cov @ w)),
+            "weights": dict(zip(mean_returns.index, w)),
+            "label": "⭐ Max-Sharpe (tangent)"
+        }
+
+    return df, specials
 
 
 def risk_parity_weights(cov: np.ndarray) -> np.ndarray:
@@ -573,7 +834,24 @@ if run_btn:
             raw_w = risk_parity_weights(cov_sel)
 
         elif "Black-Litterman" in methode_opti:
-            market_caps = np.ones(n)  # poids équipondérés comme proxy market cap si indisponibles
+            # ── Market caps réelles (CAPM equilibrium) ──────────────────
+            with st.spinner("📡 Récupération des market caps…"):
+                raw_caps = get_market_caps(top_tickers)
+            market_caps = np.array([raw_caps.get(t, 1.0) for t in top_tickers])
+
+            # Diagnostique : affiche la source de chaque cap
+            cap_labels = []
+            for t in top_tickers:
+                v = raw_caps.get(t)
+                if t == "OBLIG_SIMUL":
+                    cap_labels.append(f"{TICKER_NAMES.get(t,t)}: synthétique")
+                elif v == float(np.median([x for x in raw_caps.values() if x])):
+                    cap_labels.append(f"{TICKER_NAMES.get(t,t)}: fallback médiane")
+                else:
+                    cap_labels.append(f"{TICKER_NAMES.get(t,t)}: {v/1e9:.1f} Md€")
+            with st.expander("🏦 Market caps utilisées pour l'équilibre BL", expanded=False):
+                st.caption("  ·  ".join(cap_labels))
+
             view_idx = top_tickers.index(bl_view_asset) if bl_view_asset in top_tickers else 0
             mu_bl = black_litterman(
                 mean_sel.values,
@@ -672,11 +950,12 @@ if run_btn:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 Allocation & Composition",
         "⚠️ Risk Management",
         "🕰️ Backtest Historique",
-        "🚀 Projections Monte-Carlo"
+        "🚀 Projections Monte-Carlo",
+        "📐 Frontière Efficiente"
     ])
 
     # ── TAB 1 : ALLOCATION ──────────────────────────────────────────────
@@ -991,6 +1270,243 @@ TE = 5 % → votre performance dévie d'environ ±5 %/an du MSCI World.
             )
             st.plotly_chart(fig_dd, use_container_width=True)
 
+
+        # ── ROLLING METRICS ─────────────────────────────────────────────────
+        if len(bt_series) > 60:
+            st.markdown("---")
+            st.subheader("📈 Métriques Glissantes")
+
+            roll_col1, roll_col2 = st.columns([1, 3])
+            with roll_col1:
+                roll_window = st.select_slider(
+                    "Fenêtre glissante",
+                    options=[21, 42, 63, 126, 252],
+                    value=126,
+                    format_func=lambda x: {
+                        21: "1 mois", 42: "2 mois", 63: "3 mois",
+                        126: "6 mois", 252: "1 an"
+                    }[x],
+                    key="roll_window_slider"
+                )
+                rf_daily = (1 + 0.035) ** (1 / 252) - 1
+                show_bench_rolling = st.checkbox(
+                    "Afficher benchmark", value=True, key="roll_bench_cb"
+                )
+
+            port_r = bt_series.pct_change().dropna()
+
+            # ── Rolling Sharpe ───────────────────────────────────────────────
+            excess = port_r - rf_daily
+            roll_mean   = excess.rolling(roll_window).mean()
+            roll_std    = excess.rolling(roll_window).std()
+            roll_sharpe = (roll_mean / roll_std) * (252 ** 0.5)
+            roll_sharpe = roll_sharpe.dropna()
+
+            bench_roll_sharpe = None
+            if show_bench_rolling and bench_data is not None:
+                bench_r = bench_data.pct_change().dropna()
+                bench_excess = bench_r - rf_daily
+                brs_mean = bench_excess.rolling(roll_window).mean()
+                brs_std  = bench_excess.rolling(roll_window).std()
+                bench_roll_sharpe = (brs_mean / brs_std) * (252 ** 0.5)
+                bench_roll_sharpe = bench_roll_sharpe.dropna()
+
+            fig_rs = go.Figure()
+
+            # Zone verte (Sharpe > 1) et rouge (< 0)
+            fig_rs.add_hrect(y0=1, y1=max(roll_sharpe.max() + 0.5, 3.5),
+                             fillcolor="rgba(52,211,153,0.04)", line_width=0)
+            fig_rs.add_hrect(y0=min(roll_sharpe.min() - 0.5, -2), y1=0,
+                             fillcolor="rgba(248,113,113,0.04)", line_width=0)
+            fig_rs.add_hline(y=1,  line_color="#34d399", line_dash="dot",
+                             line_width=0.8, annotation_text="Sharpe = 1",
+                             annotation_font_size=10, annotation_font_color="#34d399")
+            fig_rs.add_hline(y=0,  line_color="#64748b", line_width=0.5)
+
+            # Courbe principale — colorée positif/négatif via deux traces
+            pos_mask = roll_sharpe >= 0
+            neg_mask = roll_sharpe < 0
+
+            if pos_mask.any():
+                rs_pos = roll_sharpe.where(pos_mask)
+                fig_rs.add_trace(go.Scatter(
+                    x=rs_pos.index, y=rs_pos.values,
+                    name="Sharpe ≥ 0",
+                    line=dict(color="#38bdf8", width=2),
+                    connectgaps=False
+                ))
+            if neg_mask.any():
+                rs_neg = roll_sharpe.where(neg_mask)
+                fig_rs.add_trace(go.Scatter(
+                    x=rs_neg.index, y=rs_neg.values,
+                    name="Sharpe < 0",
+                    line=dict(color="#f87171", width=2),
+                    connectgaps=False
+                ))
+
+            if bench_roll_sharpe is not None:
+                fig_rs.add_trace(go.Scatter(
+                    x=bench_roll_sharpe.index, y=bench_roll_sharpe.values,
+                    name="Benchmark",
+                    line=dict(color="#94a3b8", width=1.5, dash="dot"),
+                    opacity=0.7
+                ))
+
+            fig_rs.update_layout(
+                title=f"Sharpe Ratio glissant ({roll_window}j · Rf=3.5%)",
+                xaxis_title=None, yaxis_title="Sharpe",
+                hovermode="x unified",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#c8d6e5",
+                legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                yaxis=dict(gridcolor="rgba(100,116,139,0.12)", zeroline=False),
+                xaxis=dict(gridcolor="rgba(0,0,0,0)")
+            )
+            st.plotly_chart(fig_rs, use_container_width=True)
+
+            # ── Rolling Volatility ───────────────────────────────────────────
+            roll_vol = port_r.rolling(roll_window).std() * (252 ** 0.5) * 100
+            roll_vol = roll_vol.dropna()
+
+            bench_roll_vol = None
+            if show_bench_rolling and bench_data is not None:
+                bench_r2 = bench_data.pct_change().dropna()
+                bench_roll_vol = bench_r2.rolling(roll_window).std() * (252 ** 0.5) * 100
+                bench_roll_vol = bench_roll_vol.dropna()
+
+            # Percentiles pour la bande de confiance
+            vol_p25 = float(roll_vol.quantile(0.25))
+            vol_p75 = float(roll_vol.quantile(0.75))
+
+            fig_rv = go.Figure()
+
+            # Bande inter-quartile (zone normale de vol)
+            fig_rv.add_hrect(
+                y0=vol_p25, y1=vol_p75,
+                fillcolor="rgba(56,189,248,0.05)",
+                line_width=0,
+                annotation_text="Zone normale (Q25–Q75)",
+                annotation_position="top right",
+                annotation_font_size=9,
+                annotation_font_color="#64748b"
+            )
+
+            # Fill sous la courbe
+            fig_rv.add_trace(go.Scatter(
+                x=roll_vol.index, y=roll_vol.values,
+                fill="tozeroy",
+                fillcolor="rgba(56,189,248,0.06)",
+                line=dict(color="#38bdf8", width=2),
+                name="Volatilité portefeuille"
+            ))
+
+            if bench_roll_vol is not None:
+                fig_rv.add_trace(go.Scatter(
+                    x=bench_roll_vol.index, y=bench_roll_vol.values,
+                    line=dict(color="#94a3b8", width=1.5, dash="dot"),
+                    name="Volatilité benchmark",
+                    opacity=0.7
+                ))
+
+            # Ligne de vol moyenne
+            avg_vol = float(roll_vol.mean())
+            fig_rv.add_hline(
+                y=avg_vol, line_color="#64748b", line_dash="dash", line_width=0.8,
+                annotation_text=f"Moy. {avg_vol:.1f}%",
+                annotation_font_size=10, annotation_font_color="#64748b"
+            )
+
+            fig_rv.update_layout(
+                title=f"Volatilité Annualisée Glissante ({roll_window}j)",
+                xaxis_title=None, yaxis_title="Vol (%/an)",
+                hovermode="x unified",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#c8d6e5",
+                legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                yaxis=dict(
+                    gridcolor="rgba(100,116,139,0.12)",
+                    zeroline=False,
+                    ticksuffix="%"
+                ),
+                xaxis=dict(gridcolor="rgba(0,0,0,0)")
+            )
+            st.plotly_chart(fig_rv, use_container_width=True)
+
+            # ── Rolling Beta ──────────────────────────────────────────────────
+            if bench_data is not None:
+                bench_r3 = bench_data.pct_change().dropna()
+                aligned = pd.concat([port_r, bench_r3], axis=1).dropna()
+                aligned.columns = ["port", "bench"]
+
+                roll_beta = (
+                    aligned["port"].rolling(roll_window)
+                    .cov(aligned["bench"])
+                    /
+                    aligned["bench"].rolling(roll_window).var()
+                ).dropna()
+
+                fig_rb = go.Figure()
+                fig_rb.add_hline(y=1.0, line_color="#64748b", line_dash="dot",
+                                 line_width=0.8,
+                                 annotation_text="Beta = 1 (= marché)",
+                                 annotation_font_size=10,
+                                 annotation_font_color="#64748b")
+                fig_rb.add_hrect(y0=0.8, y1=1.2,
+                                 fillcolor="rgba(100,116,139,0.06)", line_width=0)
+
+                beta_pos = roll_beta.where(roll_beta >= 1)
+                beta_neg = roll_beta.where(roll_beta < 1)
+
+                if not beta_pos.dropna().empty:
+                    fig_rb.add_trace(go.Scatter(
+                        x=beta_pos.index, y=beta_pos.values,
+                        name="Beta ≥ 1 (agressif)",
+                        line=dict(color="#fb923c", width=2),
+                        connectgaps=False
+                    ))
+                if not beta_neg.dropna().empty:
+                    fig_rb.add_trace(go.Scatter(
+                        x=beta_neg.index, y=beta_neg.values,
+                        name="Beta < 1 (défensif)",
+                        line=dict(color="#34d399", width=2),
+                        connectgaps=False
+                    ))
+
+                fig_rb.update_layout(
+                    title=f"Beta Glissant vs MSCI World ({roll_window}j)",
+                    xaxis_title=None, yaxis_title="Beta",
+                    hovermode="x unified",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font_color="#c8d6e5",
+                    legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                    yaxis=dict(gridcolor="rgba(100,116,139,0.12)", zeroline=False),
+                    xaxis=dict(gridcolor="rgba(0,0,0,0)")
+                )
+                st.plotly_chart(fig_rb, use_container_width=True)
+
+            # ── Mini stats glissantes ─────────────────────────────────────────
+            st.markdown("##### Stats sur la fenêtre glissante")
+            last_n = min(roll_window, len(roll_sharpe))
+            ms1, ms2, ms3, ms4 = st.columns(4)
+            ms1.metric(
+                "Sharpe actuel",
+                f"{roll_sharpe.iloc[-1]:.2f}",
+                delta=f"{roll_sharpe.iloc[-1] - roll_sharpe.mean():.2f} vs moy.",
+                delta_color="normal"
+            )
+            ms2.metric(
+                "Vol actuelle",
+                f"{roll_vol.iloc[-1]:.1f}%",
+                delta=f"{roll_vol.iloc[-1] - roll_vol.mean():.1f}% vs moy.",
+                delta_color="inverse"
+            )
+            ms3.metric("Sharpe max (historique)", f"{roll_sharpe.max():.2f}")
+            ms4.metric("Vol max (historique)", f"{roll_vol.max():.1f}%")
+
+
     # ── TAB 3 : BACKTEST ──────────────────────────────────────────────
     with tab3:
         freq_label = rebalancing_freq
@@ -1002,6 +1518,26 @@ TE = 5 % → votre performance dévie d'environ ±5 %/an du MSCI World.
             bt_norm = bt_series / bt_series.iloc[0] * 100
 
             fig_bt = go.Figure()
+
+            # Zones de crise annotées sur le backtest principal
+            crisis_shading = [
+                ("2008-09-01", "2009-03-31", "rgba(248,113,113,0.08)", "2008"),
+                ("2020-02-19", "2020-03-23", "rgba(251,146,60,0.12)",  "Covid"),
+                ("2022-01-03", "2022-10-12", "rgba(251,191,36,0.08)",  "2022"),
+            ]
+            for cs_start, cs_end, cs_color, cs_label in crisis_shading:
+                cs_s = pd.Timestamp(cs_start)
+                cs_e = pd.Timestamp(cs_end)
+                if cs_s >= bt_norm.index[0] and cs_s <= bt_norm.index[-1]:
+                    fig_bt.add_vrect(
+                        x0=cs_s, x1=min(cs_e, bt_norm.index[-1]),
+                        fillcolor=cs_color, line_width=0,
+                        annotation_text=cs_label,
+                        annotation_position="top left",
+                        annotation_font_size=10,
+                        annotation_font_color="#94a3b8"
+                    )
+
             fig_bt.add_trace(go.Scatter(
                 x=bt_norm.index, y=bt_norm.values,
                 name="Portefeuille Optimisé",
@@ -1042,6 +1578,160 @@ TE = 5 % → votre performance dévie d'environ ±5 %/an du MSCI World.
                           delta=f"{alpha:.1f}%", delta_color="normal")
         else:
             st.warning("Données insuffisantes pour le backtest.")
+
+        # ── STRESS TESTS ────────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🔥 Analyse de Stress — Crises Historiques")
+        st.caption(
+            "Simulation de la performance de votre portefeuille actuel sur chaque crise passée. "
+            "Aucun rebalancing intra-crise. Poche sécurisée capitalisée au taux paramétré."
+        )
+
+        with st.spinner("⏳ Calcul des stress tests…"):
+            stress_results = run_stress_tests(
+                data, final_weights, BENCHMARK_TICKER, STRESS_SCENARIOS
+            )
+
+        # ── Cartes de résumé (1 par scénario) ───────────────────────────────
+        stress_cols = st.columns(len(stress_results))
+        for col, sr in zip(stress_cols, stress_results):
+            with col:
+                if not sr["available"]:
+                    st.markdown(f"""
+                    <div style="border:0.5px solid #1e3a5f;border-radius:8px;padding:12px;opacity:0.5">
+                        <div style="font-size:12px;font-weight:500;color:#94a3b8">{sr['name']}</div>
+                        <div style="font-size:11px;color:#64748b;margin-top:4px">Données non disponibles<br>({sr['start']} → {sr['end']})</div>
+                    </div>""", unsafe_allow_html=True)
+                    continue
+
+                port_p = sr["port_perf"]
+                bench_p = sr["bench_perf"]
+                port_dd = sr["port_dd"]
+                ratio = sr["ratio"]
+
+                # Couleur de la perf portefeuille
+                perf_color = "#34d399" if port_p >= 0 else "#f87171" if port_p < -0.15 else "#fb923c"
+                ratio_txt = f"Protection : +{ratio*100:.0f}%" if ratio and ratio > 0 else (f"Sous-perf : {ratio*100:.0f}%" if ratio else "N/A")
+                ratio_color = "#34d399" if ratio and ratio > 0 else "#f87171"
+
+                st.markdown(f"""
+                <div style="border:0.5px solid {sr['color']}40;border-left:3px solid {sr['color']};border-radius:8px;padding:14px 12px;background:rgba(17,24,39,0.6)">
+                    <div style="font-size:11px;font-weight:500;color:{sr['color']};margin-bottom:6px">{sr['name']}</div>
+                    <div style="font-size:22px;font-weight:600;color:{perf_color};font-family:monospace">{port_p*100:+.1f}%</div>
+                    <div style="font-size:10px;color:#64748b;margin-top:2px">Portefeuille</div>
+                    <div style="border-top:0.5px solid #1e3a5f;margin:8px 0"></div>
+                    <div style="font-size:11px;color:#64748b">Benchmark : <span style="color:#94a3b8">{f"{bench_p*100:+.1f}%" if bench_p is not None else "N/A"}</span></div>
+                    <div style="font-size:11px;color:#64748b">Max DD : <span style="color:#f87171">{port_dd*100:.1f}%</span></div>
+                    <div style="font-size:11px;color:{ratio_color};margin-top:4px">{ratio_txt}</div>
+                </div>""", unsafe_allow_html=True)
+
+        # ── Graphiques détaillés par scénario ────────────────────────────────
+        st.markdown("#### Trajectoires détaillées par crise")
+        available_scenarios = [sr for sr in stress_results if sr["available"]]
+
+        if available_scenarios:
+            n_cols = min(2, len(available_scenarios))
+            rows = [available_scenarios[i:i+n_cols] for i in range(0, len(available_scenarios), n_cols)]
+
+            for row in rows:
+                plot_cols = st.columns(n_cols)
+                for col, sr in zip(plot_cols, row):
+                    with col:
+                        fig_s = go.Figure()
+
+                        # Zone de fond colorée selon la sévérité
+                        fig_s.add_hrect(
+                            y0=0, y1=1,
+                            fillcolor=f"{sr['color']}08",
+                            line_width=0
+                        )
+
+                        # Courbe portefeuille
+                        cum_vals = sr["cum_series"].values * 100 - 100
+                        fig_s.add_trace(go.Scatter(
+                            x=sr["cum_series"].index,
+                            y=cum_vals,
+                            name="Portefeuille",
+                            line=dict(color="#38bdf8", width=2),
+                            fill="tozeroy",
+                            fillcolor="rgba(56,189,248,0.06)"
+                        ))
+
+                        # Courbe benchmark
+                        if sr["bench_series"] is not None:
+                            bench_vals = sr["bench_series"].values * 100 - 100
+                            fig_s.add_trace(go.Scatter(
+                                x=sr["bench_series"].index,
+                                y=bench_vals,
+                                name="MSCI World",
+                                line=dict(color="#94a3b8", width=1.5, dash="dot")
+                            ))
+
+                        # Ligne zéro
+                        fig_s.add_hline(y=0, line_color="#334155", line_width=0.5)
+
+                        fig_s.update_layout(
+                            title=dict(
+                                text=sr["name"],
+                                font=dict(size=12, color=sr["color"])
+                            ),
+                            xaxis_title=None,
+                            yaxis_title="Variation (%)",
+                            hovermode="x unified",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            font_color="#c8d6e5",
+                            legend=dict(
+                                orientation="h", y=1.1, x=0,
+                                font=dict(size=9)
+                            ),
+                            margin=dict(t=50, b=30, l=40, r=10),
+                            height=280
+                        )
+                        fig_s.update_yaxes(ticksuffix="%", gridcolor="rgba(100,116,139,0.1)")
+                        fig_s.update_xaxes(gridcolor="rgba(0,0,0,0)")
+                        st.plotly_chart(fig_s, use_container_width=True)
+                        st.caption(sr["desc"])
+        else:
+            st.info("💡 Les crises sélectionnées sont antérieures à la fenêtre de données disponibles (10 ans). La crise 2008 nécessite des données pré-2009.")
+
+        # ── Tableau récapitulatif ────────────────────────────────────────────
+        st.markdown("#### Tableau récapitulatif")
+        stress_table_rows = []
+        for sr in stress_results:
+            if sr["available"]:
+                stress_table_rows.append({
+                    "Scénario": sr["name"],
+                    "Période": f"{sr['start']} → {sr['end']}",
+                    "Perf Portefeuille %": round(sr["port_perf"] * 100, 2),
+                    "Perf Benchmark %": round(sr["bench_perf"] * 100, 2) if sr["bench_perf"] is not None else None,
+                    "Max DD %": round(sr["port_dd"] * 100, 2),
+                    "Ratio Protection %": round(sr["ratio"] * 100, 1) if sr["ratio"] is not None else None,
+                })
+        if stress_table_rows:
+            df_stress = pd.DataFrame(stress_table_rows)
+            st.dataframe(
+                df_stress,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Perf Portefeuille %": st.column_config.NumberColumn(format="%.2f %%"),
+                    "Perf Benchmark %": st.column_config.NumberColumn(format="%.2f %%"),
+                    "Max DD %": st.column_config.NumberColumn(format="%.2f %%"),
+                    "Ratio Protection %": st.column_config.NumberColumn(
+                        format="%.1f %%",
+                        help=">0% = portefeuille perd moins que le benchmark en termes relatifs"
+                    ),
+                }
+            )
+
+        st.markdown("""
+        <div style="font-size:11px;color:#475569;font-family:monospace;margin-top:1rem;padding:10px;border:0.5px solid #1e3a5f;border-radius:6px">
+        ⚠️ Stress tests calculés sur les actifs disponibles dans yfinance pour la période concernée.
+        La crise 2008 peut être indisponible si le portefeuille contient des actifs cotés après 2010.
+        Simulation sans levier, sans dérivés, sans short selling.
+        </div>
+        """, unsafe_allow_html=True)
 
     # ── TAB 4 : MONTE CARLO ──────────────────────────────────────────
     with tab4:
@@ -1131,6 +1821,226 @@ TE = 5 % → votre performance dévie d'environ ±5 %/an du MSCI World.
         Rendements espérés calculés sur données historiques — horizon d'estimation : 10 ans max.
         </div>
         """, unsafe_allow_html=True)
+
+    # ── TAB 5 : FRONTIÈRE EFFICIENTE ────────────────────────────────────
+    with tab5:
+        st.info(
+            "📐 Chaque point représente un portefeuille optimal (variance minimale) "
+            "pour un niveau de rendement cible. La couleur encode le **Sharpe Ratio**. "
+            "Les actifs individuels sont affichés pour référence."
+        )
+
+        with st.spinner("🧮 Calcul de la frontière efficiente (80 portefeuilles)…"):
+            # Exclure la poche sécurisée du calcul frontier (vol artificielle = 0.01)
+            fe_tickers = [t for t in top_tickers if t != "OBLIG_SIMUL"]
+            if len(fe_tickers) >= 2:
+                mean_fe = mean_sel[fe_tickers]
+                cov_fe  = cov_df.loc[fe_tickers, fe_tickers].values
+                df_frontier, specials = compute_efficient_frontier(
+                    mean_fe, cov_fe, n_points=80, max_w=max_position
+                )
+            else:
+                df_frontier = pd.DataFrame()
+                specials = {}
+
+        if df_frontier.empty:
+            st.warning("Pas assez d'actifs pour tracer la frontière.")
+        else:
+            fig_ef = go.Figure()
+
+            # ── Zone sous la frontière (fill visuel) ──────────────────
+            fig_ef.add_trace(go.Scatter(
+                x=df_frontier["vol"] * 100,
+                y=df_frontier["ret"] * 100,
+                fill="tozeroy",
+                fillcolor="rgba(56,189,248,0.04)",
+                line=dict(color="rgba(0,0,0,0)"),
+                showlegend=False,
+                hoverinfo="skip"
+            ))
+
+            # ── Courbe frontière colorée par Sharpe ───────────────────
+            fig_ef.add_trace(go.Scatter(
+                x=df_frontier["vol"] * 100,
+                y=df_frontier["ret"] * 100,
+                mode="markers+lines",
+                marker=dict(
+                    size=6,
+                    color=df_frontier["sharpe"],
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(
+                        title="Sharpe",
+                        thickness=12,
+                        len=0.6,
+                        tickformat=".2f"
+                    ),
+                    line=dict(width=0)
+                ),
+                line=dict(color="rgba(56,189,248,0.3)", width=1.5),
+                name="Frontière efficiente",
+                hovertemplate=(
+                    "<b>Frontière</b><br>"
+                    "Rendement : %{y:.2f}%<br>"
+                    "Volatilité : %{x:.2f}%<br>"
+                    "Sharpe : %{marker.color:.2f}<extra></extra>"
+                )
+            ))
+
+            # ── Actifs individuels ────────────────────────────────────
+            ind_vols_fe  = {t: float(ind_vols[t]) for t in fe_tickers if t in ind_vols}
+            ind_rets_fe  = {t: float(mean_sel[t]) for t in fe_tickers if t in mean_sel}
+            ind_sharpe_fe = {
+                t: (ind_rets_fe[t] - 0.035) / ind_vols_fe[t]
+                for t in fe_tickers
+                if t in ind_vols_fe and ind_vols_fe[t] > 0
+            }
+
+            fig_ef.add_trace(go.Scatter(
+                x=[ind_vols_fe[t] * 100 for t in fe_tickers if t in ind_vols_fe],
+                y=[ind_rets_fe[t]  * 100 for t in fe_tickers if t in ind_rets_fe],
+                mode="markers+text",
+                marker=dict(
+                    size=9,
+                    color=[ind_sharpe_fe.get(t, 0) for t in fe_tickers if t in ind_vols_fe],
+                    colorscale="Viridis",
+                    symbol="diamond",
+                    line=dict(color="rgba(255,255,255,0.6)", width=1),
+                    showscale=False
+                ),
+                text=[TICKER_NAMES.get(t, t) for t in fe_tickers if t in ind_vols_fe],
+                textposition="top center",
+                textfont=dict(size=9, color="#94a3b8"),
+                name="Actifs individuels",
+                hovertemplate=(
+                    "<b>%{text}</b><br>"
+                    "Rendement : %{y:.2f}%<br>"
+                    "Volatilité : %{x:.2f}%<extra></extra>"
+                )
+            ))
+
+            # ── Portefeuille optimisé (notre résultat) ────────────────
+            fig_ef.add_trace(go.Scatter(
+                x=[port_vol_annual * 100],
+                y=[port_ret_annual * 100],
+                mode="markers+text",
+                marker=dict(size=16, color="#38bdf8", symbol="star",
+                            line=dict(color="#ffffff", width=1.5)),
+                text=["Votre portefeuille"],
+                textposition="bottom right",
+                textfont=dict(size=11, color="#38bdf8"),
+                name="Votre portefeuille",
+                hovertemplate=(
+                    "<b>Votre portefeuille</b><br>"
+                    "Rendement : %{y:.2f}%<br>"
+                    "Volatilité : %{x:.2f}%<extra></extra>"
+                )
+            ))
+
+            # ── Portefeuilles spéciaux ────────────────────────────────
+            special_colors = {"min_vol": "#a78bfa", "max_sharpe": "#34d399"}
+            special_symbols = {"min_vol": "circle", "max_sharpe": "star-triangle-up"}
+            for key, sp in specials.items():
+                fig_ef.add_trace(go.Scatter(
+                    x=[sp["vol"] * 100],
+                    y=[sp["ret"] * 100],
+                    mode="markers+text",
+                    marker=dict(
+                        size=14,
+                        color=special_colors.get(key, "#fb923c"),
+                        symbol=special_symbols.get(key, "circle"),
+                        line=dict(color="#ffffff", width=1.5)
+                    ),
+                    text=[sp["label"]],
+                    textposition="top right",
+                    textfont=dict(size=10, color=special_colors.get(key, "#fb923c")),
+                    name=sp["label"],
+                    hovertemplate=(
+                        f"<b>{sp['label']}</b><br>"
+                        "Rendement : %{y:.2f}%<br>"
+                        "Volatilité : %{x:.2f}%<br>"
+                        f"Sharpe : {sp['sharpe']:.2f}<extra></extra>"
+                    )
+                ))
+
+            # ── Ligne du Capital Market Line (CML) ────────────────────
+            if "max_sharpe" in specials:
+                sp_ms = specials["max_sharpe"]
+                cml_vols = np.linspace(0, sp_ms["vol"] * 1.5, 50)
+                sharpe_t = sp_ms["sharpe"]
+                cml_rets = 0.035 + sharpe_t * cml_vols
+                fig_ef.add_trace(go.Scatter(
+                    x=cml_vols * 100,
+                    y=cml_rets * 100,
+                    mode="lines",
+                    line=dict(color="rgba(52,211,153,0.35)", width=1.5, dash="dot"),
+                    name="Capital Market Line",
+                    hoverinfo="skip"
+                ))
+
+            # ── Layout ────────────────────────────────────────────────
+            fig_ef.update_layout(
+                xaxis_title="Volatilité annuelle (%)",
+                yaxis_title="Rendement espéré net TER (%)",
+                hovermode="closest",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#c8d6e5",
+                legend=dict(
+                    orientation="h", y=-0.15, x=0,
+                    font=dict(size=11),
+                    bgcolor="rgba(0,0,0,0)"
+                ),
+                xaxis=dict(gridcolor="rgba(100,116,139,0.15)", zeroline=False),
+                yaxis=dict(gridcolor="rgba(100,116,139,0.15)", zeroline=False),
+                margin=dict(t=20, b=20)
+            )
+            st.plotly_chart(fig_ef, use_container_width=True)
+
+            # ── Tableau comparatif des 3 portefeuilles clés ───────────
+            st.markdown("### 📊 Comparaison des portefeuilles clés")
+            rows_compare = []
+            # Notre portefeuille
+            rows_compare.append({
+                "Portefeuille": "⭐ Votre portefeuille",
+                "Rendement %": round(port_ret_annual * 100, 2),
+                "Volatilité %": round(port_vol_annual * 100, 2),
+                "Sharpe": round((port_ret_annual - 0.035) / port_vol_annual, 2) if port_vol_annual > 0 else 0.0,
+            })
+            for key, sp in specials.items():
+                rows_compare.append({
+                    "Portefeuille": sp["label"],
+                    "Rendement %": round(sp["ret"] * 100, 2),
+                    "Volatilité %": round(sp["vol"] * 100, 2),
+                    "Sharpe": round(sp["sharpe"], 2),
+                })
+            df_compare = pd.DataFrame(rows_compare)
+            st.dataframe(
+                df_compare, use_container_width=True, hide_index=True,
+                column_config={
+                    "Rendement %": st.column_config.NumberColumn(format="%.2f %%"),
+                    "Volatilité %": st.column_config.NumberColumn(format="%.2f %%"),
+                    "Sharpe": st.column_config.NumberColumn(format="%.2f"),
+                }
+            )
+
+            # ── Composition du max-Sharpe ─────────────────────────────
+            if "max_sharpe" in specials:
+                with st.expander("🔍 Composition du portefeuille Max-Sharpe"):
+                    ms_w = specials["max_sharpe"]["weights"]
+                    df_ms = pd.DataFrame({
+                        "Actif": [TICKER_NAMES.get(t, t) for t in ms_w if ms_w[t] > 0.005],
+                        "Poids %": [round(v * 100, 1) for t, v in ms_w.items() if v > 0.005],
+                        "Montant (€)": [round(v * montant, 0) for t, v in ms_w.items() if v > 0.005],
+                    })
+                    st.dataframe(
+                        df_ms, use_container_width=True, hide_index=True,
+                        column_config={
+                            "Poids %": st.column_config.NumberColumn(format="%.1f %%"),
+                            "Montant (€)": st.column_config.NumberColumn(format="%.0f €"),
+                        }
+                    )
+
 
 else:
     st.markdown("""
